@@ -38,16 +38,29 @@ BUCKET_NAME = os.getenv('R2_BUCKET_NAME')
 MLS_BASE_URL = "http://images.realtyserver.com/photo_server.php"
 
 # Validate image name
+def normalize_image_name(image_name: str) -> str:
+    """Remove .jpg extension if present."""
+    if image_name.lower().endswith('.jpg'):
+        return image_name[:-4]
+    return image_name
+
 def is_valid_image_name(image_name: str) -> bool:
     """Check if the image name is valid and safe."""
-    return bool(re.match(r'^[a-zA-Z0-9_-]+\.(jpg|jpeg|png|gif)$', image_name))
+    # First normalize by removing .jpg if present
+    base_name = normalize_image_name(image_name)
+    return bool(re.match(r'^[0-9A-F]+\.L\d+$', base_name, re.IGNORECASE))
+
+def get_storage_key(image_name: str) -> str:
+    """Convert MLS image name to storage key with .jpg extension."""
+    base_name = normalize_image_name(image_name)
+    return f"{base_name}.jpg"
 
 async def fetch_image_from_mls(image_name: str) -> Optional[bytes]:
     """Fetch image from MLS server."""
     params = {
         'btnSubmit': 'GetPhoto',
         'board': 'panama',
-        'name': image_name
+        'name': normalize_image_name(image_name)  # Ensure we use normalized name
     }
     
     try:
@@ -69,11 +82,13 @@ async def get_image(image_name: str):
         raise HTTPException(status_code=400, detail="Invalid image name")
     
     try:
+        storage_key = get_storage_key(image_name)
+        
         # Try to get image from R2
         try:
-            r2_response = r2.get_object(Bucket=BUCKET_NAME, Key=image_name)
+            r2_response = r2.get_object(Bucket=BUCKET_NAME, Key=storage_key)
             image_data = r2_response['Body'].read()
-            content_type = r2_response.get('ContentType', 'image/jpeg')
+            content_type = 'image/jpeg'
             
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchKey':
@@ -86,16 +101,16 @@ async def get_image(image_name: str):
                 # Validate image data
                 try:
                     img = Image.open(BytesIO(image_data))
-                    content_type = f"image/{img.format.lower()}"
+                    content_type = 'image/jpeg'
                 except Exception as e:
                     logger.error(f"Invalid image data received: {e}")
                     raise HTTPException(status_code=400, detail="Invalid image data")
                 
-                # Store in R2
+                # Store in R2 with .jpg extension
                 try:
                     r2.put_object(
                         Bucket=BUCKET_NAME,
-                        Key=image_name,
+                        Key=storage_key,
                         Body=image_data,
                         ContentType=content_type
                     )
