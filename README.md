@@ -1,37 +1,22 @@
 # MLS Image Proxy Service
 
-A lightweight, production-ready image proxy service that caches MLS listing images using Cloudflare R2 storage.
-
-## Features
-
-- Serves images from Cloudflare R2 storage
-- Automatically fetches and caches images from MLS source
-- Input validation and sanitization
-- Proper error handling and logging
-- Cache-Control headers for optimal performance
+A production-ready system for serving and caching MLS listing images, consisting of:
+1. FastAPI proxy service with Cloudflare R2 storage
+2. Symfony MLS integration for data synchronization
 
 ## Prerequisites
 
 - Python 3.8+
-- Cloudflare R2 account and credentials
-- Nginx or Apache web server
+- PHP 7.2+
+- Cloudflare R2 account
+- Apache web server
+- MLS API access
 
-## Installation
+## Configuration
 
-1. Clone the repository:
-```bash
-git clone [your-repo-url]
-cd mlspa-image-proxy
-```
+### 1. Environment Setup
 
-2. Create a virtual environment and install dependencies:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: .\venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-3. Create a `.env` file with your Cloudflare R2 credentials:
+Create a `.env` file with your Cloudflare R2 credentials:
 ```
 R2_ACCOUNT_ID=your_account_id
 R2_ACCESS_KEY_ID=your_access_key
@@ -39,17 +24,18 @@ R2_SECRET_ACCESS_KEY=your_secret_key
 R2_BUCKET_NAME=your_bucket_name
 ```
 
-## Running the Service
+### 2. FastAPI Proxy Installation
 
-### Development
 ```bash
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
-```
+# Clone and setup
+git clone [your-repo-url]
+cd mlspa-image-proxy
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 
-### Production with Nginx
-
-1. Create a systemd service file `/etc/systemd/system/mlspa-proxy.service`:
-```ini
+# Create service
+sudo tee /etc/systemd/system/mlspa-proxy.service << EOF
 [Unit]
 Description=MLSPA Image Proxy
 After=network.target
@@ -63,36 +49,15 @@ ExecStart=/path/to/mlspa-image-proxy/venv/bin/uvicorn app:app --host 127.0.0.1 -
 
 [Install]
 WantedBy=multi-user.target
-```
+EOF
 
-2. Configure Nginx (create `/etc/nginx/sites-available/mlspa-proxy`):
-```nginx
-server {
-    listen 80;
-    server_name int.clientsite.com;
-
-    location /mls-images/ {
-        proxy_pass http://127.0.0.1:8000/;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        client_max_body_size 10M;
-    }
-}
-```
-
-3. Enable and start the services:
-```bash
-sudo ln -s /etc/nginx/sites-available/mlspa-proxy /etc/nginx/sites-enabled/
-sudo systemctl start mlspa-proxy
+# Start service
 sudo systemctl enable mlspa-proxy
-sudo systemctl restart nginx
+sudo systemctl start mlspa-proxy
 ```
 
-### Production with Apache
+### 3. Apache Configuration
 
-1. Create the same systemd service as above.
-
-2. Configure Apache (create `/etc/apache2/sites-available/mlspa-proxy.conf`):
 ```apache
 <VirtualHost *:80>
     ServerName int.clientsite.com
@@ -106,27 +71,79 @@ sudo systemctl restart nginx
 </VirtualHost>
 ```
 
-3. Enable required modules and site:
 ```bash
-sudo a2enmod proxy
-sudo a2enmod proxy_http
+sudo a2enmod proxy proxy_http
 sudo a2ensite mlspa-proxy
 sudo systemctl restart apache2
 ```
 
+### 4. Symfony Integration
+
+1. Update Symfony parameters:
+```yaml
+# app/config/parameters.yml
+parameters:
+    int_photos_baseurl: 'https://int.clientsite.com/mls-images/'
+```
+
+2. Configure MLS directories:
+```bash
+# Create temp directory for MLS files
+mkdir -p /tmp/$(date +%Y%m%d)/mls-photos
+chmod 755 /tmp/$(date +%Y%m%d)/mls-photos
+```
+
 ## Usage
 
-Access images via: `https://int.clientsite.com/mls-images/<image_name>`
+### Running MLS Integration
 
-## Error Handling
+```bash
+# Full sync
+/var/www/symfony/bin/console integration-force-mls:execute -vv -e prod
 
-- 400: Bad Request (invalid image name)
-- 404: Image not found
-- 500: Internal server error
+# Photos only sync
+/var/www/symfony/bin/console integration-force-mls:execute -vv -e prod \
+    --enable-photos-missing \
+    --disable-agents \
+    --disable-office \
+    --disable-residential \
+    --disable-commercial \
+    --disable-inactive
+```
+
+### Accessing Images
+
+- Format: `https://int.clientsite.com/mls-images/<image_name>`
+- Example: `https://int.clientsite.com/mls-images/12345678.L01.jpg`
+
+## System Flow
+
+1. MLS Integration Process:
+   - Symfony downloads MLS data
+   - Creates photo records in Salesforce
+   - Generates photo URLs using proxy domain
+
+2. Image Serving Process:
+   - Client requests image from proxy
+   - Proxy checks R2 cache
+   - If not cached, downloads from MLS
+   - Serves image and caches in R2
 
 ## Monitoring
 
-Check the application logs:
-```bash
-sudo journalctl -u mlspa-proxy -f
-```
+### Logs
+- FastAPI Proxy: `sudo journalctl -u mlspa-proxy -f`
+- Symfony: `/var/log/symfony/prod.log`
+- Apache: `/var/log/apache2/mlspa-proxy-error.log`
+
+### Common Issues
+
+1. Missing Photos
+   - Check temp directory permissions
+   - Verify R2 connectivity
+   - Validate MLS API access
+
+2. Integration Errors
+   - Review Symfony logs
+   - Check Salesforce API limits
+   - Verify MLS credentials
