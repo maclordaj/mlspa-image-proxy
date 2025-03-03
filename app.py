@@ -63,25 +63,88 @@ def normalize_image_name(image_name: str) -> str:
         return image_name[:-4]
     return image_name
 
+def extract_image_name(path: str) -> str:
+    """Extract image name from path that might contain a date."""
+    # Split path by / and get the last part
+    parts = path.split('/')
+    return parts[-1]
+
 def is_valid_image_name(image_name: str) -> bool:
     """Check if the image name is valid and safe."""
     # First normalize by removing .jpg and directory structure
     base_name = normalize_image_name(image_name)
-    # Allow 8-digit numbers followed by .L and more digits
-    return bool(re.match(r'^[0-9]{8}\.L\d+$', base_name))
+    # Match 8 digits followed by .L and 1-2 digits
+    return bool(re.match(r'^[0-9]{8}\.L[0-9]{1,2}$', base_name, re.IGNORECASE))
 
 def get_storage_key(image_name: str) -> str:
     """Convert MLS image name to storage key with .jpg extension."""
     base_name = normalize_image_name(image_name)
     return f"{base_name}.jpg"
 
-def extract_image_name(path: str) -> str:
-    """Extract image name from path that might contain a date."""
-    # Match either direct image name or date/image_name pattern
-    match = re.match(r'^(?:\d{8}/)?([^/]+)$', path)
-    if match:
-        return match.group(1)
-    return path
+@app.get("/mls-images/{path:path}")
+@app.get("/mls-photos/{path:path}")
+async def get_image(path: str):
+    """Main endpoint to serve images."""
+    # Extract actual image name from path
+    image_name = extract_image_name(path)
+    
+    logger.info(f"Received request for image: {image_name} (from path: {path})")
+    
+    # Validate image name
+    if not is_valid_image_name(image_name):
+        logger.warning(f"Invalid image name format: {image_name}")
+        raise HTTPException(status_code=400, detail="Invalid image name format")
+    
+    try:
+        storage_key = get_storage_key(image_name)
+        logger.debug(f"Storage key: {storage_key}")
+        
+        # Try to get image from R2
+        try:
+            logger.info(f"Attempting to fetch from R2: {storage_key}")
+            r2_response = r2.get_object(Bucket=BUCKET_NAME, Key=storage_key)
+            image_data = r2_response['Body'].read()
+            logger.info(f"Successfully retrieved image from R2: {storage_key}")
+            
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                logger.info(f"Image not found in R2, fetching from MLS: {image_name}")
+                # Image not in R2, fetch from MLS
+                image_data = await fetch_image_from_mls(image_name)
+                
+                if not image_data:
+                    logger.error(f"Failed to fetch image from MLS: {image_name}")
+                    raise HTTPException(status_code=404, detail="Image not found or invalid response from MLS")
+                
+                # Store in R2
+                try:
+                    logger.info(f"Storing image in R2: {storage_key}")
+                    r2.put_object(
+                        Bucket=BUCKET_NAME,
+                        Key=storage_key,
+                        Body=image_data,
+                        ContentType='image/jpeg'
+                    )
+                    logger.info(f"Successfully stored image in R2: {storage_key}")
+                except Exception as e:
+                    logger.error(f"Failed to store image in R2: {str(e)}")
+                    # Continue serving the image even if caching fails
+            else:
+                logger.error(f"R2 error: {str(e)}")
+                raise HTTPException(status_code=500, detail="Storage error")
+        
+        # Serve the image
+        headers = {
+            'Cache-Control': 'public, max-age=31536000',  # Cache for 1 year
+            'Content-Type': 'image/jpeg'
+        }
+        return Response(content=image_data, headers=headers)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 async def fetch_image_from_mls(image_name: str) -> Optional[bytes]:
     """Fetch image from MLS server."""
@@ -123,82 +186,7 @@ async def fetch_image_from_mls(image_name: str) -> Optional[bytes]:
         logger.error(f"Error fetching image from MLS: {str(e)}")
         return None
 
-@app.get("/mls-images/{image_name:path}")
-async def get_image(image_name: str):
-    """Main endpoint to serve images."""
-    
-    # Extract actual image name from path
-    actual_image_name = extract_image_name(image_name)
-    
-    logger.info(f"Received request for image: {actual_image_name}")
-    
-    # Validate image name
-    if not is_valid_image_name(actual_image_name):
-        logger.warning(f"Invalid image name format: {actual_image_name}")
-        raise HTTPException(status_code=400, detail="Invalid image name format")
-    
-    try:
-        storage_key = get_storage_key(actual_image_name)
-        logger.debug(f"Storage key: {storage_key}")
-        
-        # Try to get image from R2
-        try:
-            logger.info(f"Attempting to fetch from R2: {storage_key}")
-            r2_response = r2.get_object(Bucket=BUCKET_NAME, Key=storage_key)
-            image_data = r2_response['Body'].read()
-            logger.info(f"Successfully retrieved image from R2: {storage_key}")
-            
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'NoSuchKey':
-                logger.info(f"Image not found in R2, fetching from MLS: {actual_image_name}")
-                # Image not in R2, fetch from MLS
-                image_data = await fetch_image_from_mls(actual_image_name)
-                
-                if not image_data:
-                    logger.error(f"Failed to fetch image from MLS: {actual_image_name}")
-                    raise HTTPException(status_code=404, detail="Image not found or invalid response from MLS")
-                
-                # Store in R2
-                try:
-                    logger.info(f"Storing image in R2: {storage_key}")
-                    r2.put_object(
-                        Bucket=BUCKET_NAME,
-                        Key=storage_key,
-                        Body=image_data,
-                        ContentType='image/jpeg'
-                    )
-                    logger.info(f"Successfully stored image in R2: {storage_key}")
-                except Exception as e:
-                    logger.error(f"Failed to store image in R2: {str(e)}")
-                    # Continue serving the image even if caching fails
-            else:
-                logger.error(f"R2 error: {str(e)}")
-                raise HTTPException(status_code=500, detail="Storage error")
-        
-        # Serve the image
-        headers = {
-            'Cache-Control': 'public, max-age=31536000',  # Cache for 1 year
-            'Content-Type': 'image/jpeg'
-        }
-        return Response(content=image_data, headers=headers)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/mls-photos/{path:path}")
-async def get_photo(path: str):
-    """Handle mls-photos requests with optional date in path."""
-    return await get_image(path)
-
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
     return JSONResponse({"status": "healthy"})
-
-@app.get("/mls-photos/{date}/{image_name}")
-async def get_dated_image(date: str, image_name: str):
-    """Handle dated URL pattern."""
-    return await get_image(image_name)
