@@ -6,7 +6,7 @@ from pathlib import Path
 import aiohttp
 import boto3
 from botocore.exceptions import ClientError
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Path
 from fastapi.responses import Response, JSONResponse
 from dotenv import load_dotenv
 from PIL import Image
@@ -67,12 +67,21 @@ def is_valid_image_name(image_name: str) -> bool:
     """Check if the image name is valid and safe."""
     # First normalize by removing .jpg and directory structure
     base_name = normalize_image_name(image_name)
-    return bool(re.match(r'^[0-9A-F]+\.L\d+$', base_name, re.IGNORECASE))
+    # Allow 8-digit numbers followed by .L and more digits
+    return bool(re.match(r'^[0-9]{8}\.L\d+$', base_name))
 
 def get_storage_key(image_name: str) -> str:
     """Convert MLS image name to storage key with .jpg extension."""
     base_name = normalize_image_name(image_name)
     return f"{base_name}.jpg"
+
+def extract_image_name(path: str) -> str:
+    """Extract image name from path that might contain a date."""
+    # Match either direct image name or date/image_name pattern
+    match = re.match(r'^(?:\d{8}/)?([^/]+)$', path)
+    if match:
+        return match.group(1)
+    return path
 
 async def fetch_image_from_mls(image_name: str) -> Optional[bytes]:
     """Fetch image from MLS server."""
@@ -114,19 +123,22 @@ async def fetch_image_from_mls(image_name: str) -> Optional[bytes]:
         logger.error(f"Error fetching image from MLS: {str(e)}")
         return None
 
-@app.get("/mls-images/{image_name}")
+@app.get("/mls-images/{image_name:path}")
 async def get_image(image_name: str):
     """Main endpoint to serve images."""
     
-    logger.info(f"Received request for image: {image_name}")
+    # Extract actual image name from path
+    actual_image_name = extract_image_name(image_name)
+    
+    logger.info(f"Received request for image: {actual_image_name}")
     
     # Validate image name
-    if not is_valid_image_name(image_name):
-        logger.warning(f"Invalid image name format: {image_name}")
+    if not is_valid_image_name(actual_image_name):
+        logger.warning(f"Invalid image name format: {actual_image_name}")
         raise HTTPException(status_code=400, detail="Invalid image name format")
     
     try:
-        storage_key = get_storage_key(image_name)
+        storage_key = get_storage_key(actual_image_name)
         logger.debug(f"Storage key: {storage_key}")
         
         # Try to get image from R2
@@ -138,12 +150,12 @@ async def get_image(image_name: str):
             
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchKey':
-                logger.info(f"Image not found in R2, fetching from MLS: {image_name}")
+                logger.info(f"Image not found in R2, fetching from MLS: {actual_image_name}")
                 # Image not in R2, fetch from MLS
-                image_data = await fetch_image_from_mls(image_name)
+                image_data = await fetch_image_from_mls(actual_image_name)
                 
                 if not image_data:
-                    logger.error(f"Failed to fetch image from MLS: {image_name}")
+                    logger.error(f"Failed to fetch image from MLS: {actual_image_name}")
                     raise HTTPException(status_code=404, detail="Image not found or invalid response from MLS")
                 
                 # Store in R2
@@ -176,11 +188,10 @@ async def get_image(image_name: str):
         logger.error(f"Unexpected error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# Add an alias route for mls-photos
-@app.get("/mls-photos/{image_name}")
-async def get_photo(image_name: str):
-    """Alias endpoint for mls-images."""
-    return await get_image(image_name)
+@app.get("/mls-photos/{path:path}")
+async def get_photo(path: str):
+    """Handle mls-photos requests with optional date in path."""
+    return await get_image(path)
 
 @app.get("/health")
 async def health_check():
