@@ -73,8 +73,8 @@ def is_valid_image_name(image_name: str) -> bool:
     """Check if the image name is valid and safe."""
     # First normalize by removing .jpg and directory structure
     base_name = normalize_image_name(image_name)
-    # Match 8 digits followed by .L and 1-2 digits
-    return bool(re.match(r'^[0-9]{8}\.L[0-9]{1,2}$', base_name, re.IGNORECASE))
+    # Match 8 hex characters followed by .L and 1-2 digits
+    return bool(re.match(r'^[0-9A-F]{8}\.L[0-9]{1,2}$', base_name, re.IGNORECASE))
 
 def get_storage_key(image_name: str) -> str:
     """Convert MLS image name to storage key with .jpg extension."""
