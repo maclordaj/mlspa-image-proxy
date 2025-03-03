@@ -55,14 +55,17 @@ MLS_BASE_URL = "http://images.realtyserver.com/photo_server.php"
 
 # Validate image name
 def normalize_image_name(image_name: str) -> str:
-    """Remove .jpg extension if present."""
+    """Remove .jpg extension and any directory structure if present."""
+    # First remove any directory structure
+    image_name = os.path.basename(image_name)
+    # Then remove .jpg extension if present
     if image_name.lower().endswith('.jpg'):
         return image_name[:-4]
     return image_name
 
 def is_valid_image_name(image_name: str) -> bool:
     """Check if the image name is valid and safe."""
-    # First normalize by removing .jpg if present
+    # First normalize by removing .jpg and directory structure
     base_name = normalize_image_name(image_name)
     return bool(re.match(r'^[0-9A-F]+\.L\d+$', base_name, re.IGNORECASE))
 
@@ -83,15 +86,30 @@ async def fetch_image_from_mls(image_name: str) -> Optional[bytes]:
     logger.info(f"Fetching image from MLS: {base_name}")
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(MLS_BASE_URL, params=params) as response:
+            async with session.get(MLS_BASE_URL, params=params, timeout=30) as response:
                 if response.status != 200:
                     logger.error(f"MLS server returned status {response.status} for image {base_name}")
                     return None
-                content_type = response.headers.get('content-type', '')
-                if not content_type.startswith('image/'):
-                    logger.error(f"MLS server returned non-image content type: {content_type}")
+                
+                # Read the response content
+                content = await response.read()
+                
+                # Check if we got valid image data
+                if len(content) < 100:  # Basic check for too small responses
+                    logger.error(f"MLS server returned too small response for {base_name}")
                     return None
-                return await response.read()
+                    
+                # Verify it's an image
+                try:
+                    Image.open(BytesIO(content))
+                    return content
+                except Exception as e:
+                    logger.error(f"Invalid image data received for {base_name}: {str(e)}")
+                    return None
+                    
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout fetching image from MLS: {base_name}")
+        return None
     except Exception as e:
         logger.error(f"Error fetching image from MLS: {str(e)}")
         return None
@@ -117,7 +135,6 @@ async def get_image(image_name: str):
             r2_response = r2.get_object(Bucket=BUCKET_NAME, Key=storage_key)
             image_data = r2_response['Body'].read()
             logger.info(f"Successfully retrieved image from R2: {storage_key}")
-            content_type = 'image/jpeg'
             
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchKey':
@@ -129,24 +146,14 @@ async def get_image(image_name: str):
                     logger.error(f"Failed to fetch image from MLS: {image_name}")
                     raise HTTPException(status_code=404, detail="Image not found or invalid response from MLS")
                 
-                # Validate image data
-                try:
-                    img = Image.open(BytesIO(image_data))
-                    if img.format.lower() != 'jpeg':
-                        logger.warning(f"Non-JPEG image received: {img.format}")
-                    content_type = 'image/jpeg'
-                except Exception as e:
-                    logger.error(f"Invalid image data received: {str(e)}")
-                    raise HTTPException(status_code=400, detail="Invalid image data received from MLS")
-                
-                # Store in R2 with .jpg extension
+                # Store in R2
                 try:
                     logger.info(f"Storing image in R2: {storage_key}")
                     r2.put_object(
                         Bucket=BUCKET_NAME,
                         Key=storage_key,
                         Body=image_data,
-                        ContentType=content_type
+                        ContentType='image/jpeg'
                     )
                     logger.info(f"Successfully stored image in R2: {storage_key}")
                 except Exception as e:
@@ -159,17 +166,28 @@ async def get_image(image_name: str):
         # Serve the image
         headers = {
             'Cache-Control': 'public, max-age=31536000',  # Cache for 1 year
-            'Content-Type': content_type
+            'Content-Type': 'image/jpeg'
         }
         return Response(content=image_data, headers=headers)
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}", exc_info=True)  # Add full traceback
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
+
+# Add an alias route for mls-photos
+@app.get("/mls-photos/{image_name}")
+async def get_photo(image_name: str):
+    """Alias endpoint for mls-images."""
+    return await get_image(image_name)
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
     return JSONResponse({"status": "healthy"})
+
+@app.get("/mls-photos/{date}/{image_name}")
+async def get_dated_image(date: str, image_name: str):
+    """Handle dated URL pattern."""
+    return await get_image(image_name)
